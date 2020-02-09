@@ -1,0 +1,141 @@
+---
+title: "DE tests"
+author: "Kent Riemondy RBI"
+date: "2/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### DE genes between conditions
+
+Skip cluster 7 as only B6B6
+
+```{r}
+so$cluster_condition <- str_c(so$condition, "_", so$coarse_clusters)
+
+clusters_to_test <- sort(unique(so$coarse_clusters))
+
+clusters_to_test <- clusters_to_test[clusters_to_test != "7"]
+
+Idents(so) <- "cluster_condition"
+mkrs <- list()
+for (i in seq_along(clusters_to_test)){
+  message(clusters_to_test[i]) 
+  mkrs[[i]] <- FindMarkers(so, 
+              ident.1 = str_c("HLAB6_", clusters_to_test[i]),
+              ident.2 = str_c("B6B6_", clusters_to_test[i]), 
+              only.pos = FALSE)
+}
+
+names(mkrs) <- clusters_to_test
+
+mkrs <- map(mkrs, ~tibble::rownames_to_column(.x, "gene"))
+mkrs <- bind_rows(mkrs, .id = "cluster")
+
+write_tsv(mkrs, 
+          file.path(mkrs_dir, "coarse_cluster_deg_conditions.tsv"))
+```
+
+### DE genes between conditions
+
+```{r}
+
+so$cluster_condition <- str_c(so$condition, "_", so$coarse_clusters)
+
+clusters_to_test <- sort(unique(so$coarse_clusters))
+clusters_to_test <- clusters_to_test[clusters_to_test != "7"]
+
+Idents(so) <- "cluster_condition"
+mkrs <- list()
+for (i in seq_along(clusters_to_test)){
+  message(clusters_to_test[i]) 
+  mkrs[[i]] <- FindMarkers(so, 
+              ident.1 = str_c("HLAB6_", clusters_to_test[i]),
+              ident.2 = str_c("B6B6_", clusters_to_test[i]), 
+              only.pos = FALSE)
+}
+
+names(mkrs) <- clusters_to_test
+
+mkrs <- map(mkrs, ~tibble::rownames_to_column(.x, "gene"))
+mkrs <- bind_rows(mkrs, .id = "cluster")
+
+write_tsv(mkrs, 
+          file.path(mkrs_dir, "coarse_cluster_deg_conditions_soupx.tsv"))
+```
+
+
+### DE genes between b-cells/mzb1 b-cells
+
+```{r}
+deg_genes <- read_tsv(file.path(mkrs_dir, "coarse_cluster_deg_conditions_soupx.tsv"))
+
+cluster_to_plot <- 11
+
+top_n_genes <- filter(deg_genes, cluster == cluster_to_plot) %>% 
+  arrange(p_val_adj) %>% 
+  slice(1:25) %>% 
+  pull(gene)
+
+count_mat <- so@assays$RNA@data[top_n_genes, 
+                                so$coarse_clusters == cluster_to_plot]
+
+scale_mat <- t(scale(t(as.matrix(count_mat))))
+
+simple_annots <- so@meta.data[colnames(count_mat),
+                                          c("cell_types",
+                                            "coarse_clusters",
+                                            "condition")]
+
+cell_id_order <- simple_annots %>% 
+  rownames_to_column("cell") %>% 
+  arrange(condition) %>% 
+  pull(cell)
+
+ha <- HeatmapAnnotation(df = simple_annots)
+
+Heatmap(scale_mat, 
+        name = "z-score",
+        column_order = cell_id_order,
+        show_column_names = FALSE, 
+        top_annotation = ha)
+```
+
+
+```{r}
+deg_genes <- read_tsv(file.path(mkrs_dir, "coarse_cluster_deg_conditions_soupx.tsv"))
+
+cluster_to_plot <- 8
+
+top_n_genes <- filter(deg_genes, cluster == cluster_to_plot) %>% 
+  arrange(p_val_adj) %>% 
+  slice(1:25) %>% 
+  pull(gene)
+
+count_mat <- so@assays$RNA@data[top_n_genes, 
+                                so$coarse_clusters == cluster_to_plot]
+
+scale_mat <- t(scale(t(as.matrix(count_mat))))
+
+simple_annots <- so@meta.data[colnames(count_mat),
+                                          c("cell_types",
+                                            "coarse_clusters",
+                                            "condition")]
+
+cell_id_order <- simple_annots %>% 
+  rownames_to_column("cell") %>% 
+  arrange(condition) %>% 
+  pull(cell)
+
+ha <- HeatmapAnnotation(df = simple_annots)
+
+Heatmap(scale_mat, 
+        name = "z-score",
+        column_order = cell_id_order,
+        show_column_names = FALSE, 
+        top_annotation = ha)
+```

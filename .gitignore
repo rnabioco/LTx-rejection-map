@@ -1,0 +1,17 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/
+dbases/
+*.pdf
+*.tsv
+*.csv
+*.txt
+results/natalia/*
+results/joanna/*
+*cellbrowser*
+*.gz
+*.xlsx
+*.qs
+*.rds

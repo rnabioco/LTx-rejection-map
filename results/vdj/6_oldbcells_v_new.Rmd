@@ -1,0 +1,338 @@
+---
+title: "Old b-cells versus new"
+author: "Kent Riemondy RBI"
+date: "`R Sys.Date()`"
+params:
+  ncores: 4
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: cosmo
+    highlight: tango
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(cache.lazy = FALSE)
+```
+
+
+```{r libs, message=FALSE, warning=FALSE, echo=FALSE}
+source(here::here("R/utils.R"))
+library(future)
+
+plan("multicore", workers = 7)
+options(future.globals.maxSize = 2 * 1024 ^ 3)
+
+proj_dir <- here()
+data_dir <- file.path(proj_dir, "data", "cellranger", "results")
+doc_dir <- file.path(proj_dir, "docs")
+
+subdir <- "old_b_v_new_b"
+fig_dir <- file.path(subdir, "figs")
+mkrs_dir <- file.path(subdir, "markers")
+tbls_dir <- file.path(subdir, "tables")
+object_dir <- file.path(subdir, "objects")
+walk(c(fig_dir, mkrs_dir, tbls_dir, object_dir), 
+     dir.create, showWarnings = F, recursive = TRUE)
+```
+
+# Experiment Summary
+
+```{r get_data}
+
+samples_1 <- paste0("Eickelberg_", 
+                  c("B6B6_1",
+                    "B6B6_2",
+                    "B6B6_3",
+                    "HLAB6_2", 
+                    "HLAB6_3"))
+
+samples_2 <- c(
+  "1_B_65_11152018",
+  "1_B6_B6_11132018",
+  "2_HLA_5_11152018")
+
+samples_3 <- c(
+  "NaiveB6",
+  "B6_B6_171501",
+  "HLA_B6_163107",
+  "HLA_B6_18467"
+)
+
+samples <- c(samples_1, samples_2, samples_3)
+
+sample_paths <- file.path(data_dir,
+                          samples,
+                          "outs", 
+                          "filtered_feature_bc_matrix")
+
+names(sample_paths) <- c(str_remove(samples_1, "Eickelberg_"),
+                         "B6B6_5",
+                         "B6B6_4",
+                         "HLAB6_5",
+                         "Naive_B6",
+                         "B6B6_6",
+                         "HLAB6_6",
+                         "HLAB6_7")
+```
+
+```{r, eval = FALSE}
+mat <- Read10X(sample_paths)
+```
+
+```{r}
+so_new <- readRDS(file.path("vdj_alone", "objects_vdj_alone", "bcells.rds"))
+
+so_new$expt <- "5_prime"
+
+
+so_old <- readRDS(file.path("objects_2",
+                             "so_bcells_mzb1.rds"))
+
+so_old$expt <- "3_prime"
+
+so <- merge(so_new, so_old)
+```
+
+
+```{r}
+so <- FindVariableFeatures(
+  so,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+so <- ScaleData(so, verbose = TRUE)
+
+so <- RunPCA(so, 
+             npcs = 100, 
+             verbose = FALSE)
+
+ElbowPlot(so, ndims = 100)
+
+# make graphs and use graphs for UMAP
+so <- FindNeighbors(so, 
+                    reduction = "pca", 
+                    dims = 1:30, 
+                    k.param = 20L)
+
+
+so <- RunUMAP(so, 
+              graph = "RNA_snn", 
+              min.dist = 0.3)
+
+res <- c(0.075, 0.09, 0.1, 0.3, 0.5)
+so <- FindClusters(so, 
+                   resolution = res)
+
+p <- map(str_c("RNA_snn_res.", res), 
+    ~plot_umap(so, .x)) %>% 
+  plot_grid(plotlist = .,
+            nrow = 3, 
+            ncol = 2)
+
+save_plot(file.path(fig_dir, 
+                    "b_cell_clustering_settings.pdf"),
+          p,
+          nrow = 3, 
+          ncol = 2,
+          base_asp = 1.2)
+
+p <- plot_umap(so, "orig.ident")
+save_plot(file.path(fig_dir, 
+                    "sample_clustering.pdf"),
+          p,
+          base_asp = 1.2)
+
+
+p <- plot_umap(so, "expt")
+save_plot(file.path(fig_dir, 
+                    "expt_clustering.pdf"),
+          p,
+          base_asp = 1.2)
+
+p <- plot_umap(so, "Mzb1")
+save_plot(file.path(fig_dir, 
+                    "mzb1_clustering.pdf"),
+          p,
+          base_asp = 1.2)
+p
+
+so$fine_clusters <- so$RNA_snn_res.0.5
+
+Idents(so) <- "fine_clusters"
+
+plot_umap(so, "fine_clusters")
+
+saveRDS(so, file.path(object_dir, "merged_bcells.rds"))
+```
+
+```{r}
+so <- readRDS(file.path(object_dir, "harmonized_merged_bcells.rds"))
+
+to_plot <- c(
+  "expt",
+  "orig.ident",
+  "fine_clusters",
+  "Mzb1"
+)
+
+p <- map(to_plot, 
+    ~plot_umap(so, .x)) %>% 
+  plot_grid(plotlist = .,
+            nrow = 2, 
+            ncol = 2)
+p
+save_plot(file.path(fig_dir, 
+                    "merged_umap_summary.pdf"),
+          p,
+          nrow = 2, 
+          ncol = 2,
+          base_asp = 1.4)
+
+
+
+```
+### Harmonize
+
+```{r}
+library(harmony)
+so <- RunHarmony(so,
+                 group.by.vars = "expt",
+                 plot_convergence = T)
+
+so <- FindNeighbors(so,
+                    reduction = "harmony",
+                    dims = 1:20)
+
+res <- c(0.075, 0.09, 0.1, 0.3, 0.5)
+so <- FindClusters(so,
+                   resolution = res)
+
+so <- RunUMAP(so,
+              reduction = "harmony",
+              dims = 1:20,
+              reduction.name = "harmony_umap")
+
+p <- plot_feature(so, "expt", embedding = "harmony_umap")
+save_plot(file.path(fig_dir, 
+                    "harmony_expt.pdf"),
+          p,
+          base_asp = 1.2)
+
+p <- map(str_c("RNA_snn_res.", res), 
+    ~plot_feature(so, .x, embedding = "harmony_umap")) %>% 
+  plot_grid(plotlist = .,
+            nrow = 3, 
+            ncol = 2)
+p
+save_plot(file.path(fig_dir, 
+                    "harmony_b_cell_clustering_settings.pdf"),
+          p,
+          nrow = 3, 
+          ncol = 2,
+          base_asp = 1.2)
+
+
+so$fine_clusters <- so$RNA_snn_res.0.1
+
+Idents(so) <- "fine_clusters"
+plot_feature(so, "fine_clusters", embedding = "harmony_umap")
+```
+
+### Cluster markers
+
+```{r}
+library(presto)
+
+mkrs <- presto::wilcoxauc(so, "fine_clusters")
+mkrs <- group_by(mkrs, group) %>% 
+  filter(padj < 0.05) %>%  
+  arrange(padj, .by_group = TRUE) %>% 
+  ungroup()
+write_tsv(mkrs, 
+          file.path(mkrs_dir, "harmony_cluster_markers_all_data.tsv"))
+```
+
+
+
+```{r}
+topx <- mkrs %>% 
+  group_by(group) %>% 
+  top_n(10, -padj) %>% 
+  ungroup()
+```
+
+
+
+```{r, fig.width = 20, fig.height= 20}
+
+p <- DotPlot(so, 
+        features = unique(topx$feature),
+        group.by = "fine_clusters") +
+  coord_flip() +
+  labs(x = "Cluster",
+       y = "")
+
+p
+
+save_plot(file.path(fig_dir, 
+                    "cluster_marker_dotplot.pdf"), 
+          p, base_height = 24, base_asp = 1)
+```
+
+```{r}
+to_plot <- c(
+  "fine_clusters",
+  "orig.ident",
+  "condition",
+  "Mzb1",
+  "Bhlhe41",
+  "Cxcr3",
+  "Itgb1",
+  "Ctla4"
+)
+p <- map(to_plot, 
+    ~plot_feature(so, .x, embedding = "harmony_umap")) %>% 
+  plot_grid(plotlist = .,
+            nrow = 4, 
+            ncol = 2)
+
+p
+save_plot(file.path(fig_dir, 
+                    "harmony_marker_summary.pdf"), 
+          p, 
+          nrow = 4,
+          ncol = 2, 
+          base_asp = 1.4)
+
+```
+
+
+```{r}
+saveRDS(so, file.path(object_dir, "harmonized_merged_bcells.rds"))
+```
+
+
+
+```{r}
+so <- readRDS(file.path(object_dir, "harmonized_merged_bcells.rds"))
+
+plot_harmony <- function(...){
+  plot_feature(..., embedding = "harmony_umap")
+}
+
+
+plot_harmony(so, "all_sample_id")
+
+```
+

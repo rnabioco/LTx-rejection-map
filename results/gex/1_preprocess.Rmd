@@ -1,0 +1,986 @@
+---
+title: "Lung rejection scRNA-seq data preprocessing"
+author: "Kent Riemondy RBI"
+date: "`R Sys.Date()`"
+params:
+  ncores: 4
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: cosmo
+    highlight: tango
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(cache.lazy = FALSE)
+```
+
+
+```{r libs, message=FALSE, warning=FALSE, echo=FALSE}
+source(here::here("R/utils.R"))
+library(future)
+
+plan("multicore", workers = 7)
+options(future.globals.maxSize = 2 * 1024 ^ 3)
+
+proj_dir <- here()
+data_dir <- file.path(proj_dir, "data", "cellranger", "results")
+doc_dir <- file.path(proj_dir, "docs")
+
+fig_dir <- "figs"
+mkrs_dir <- "markers"
+tbls_dir <- "tables"
+object_dir <- "objects"
+walk(c(fig_dir, mkrs_dir, tbls_dir, object_dir), 
+     dir.create, showWarnings = F)
+```
+
+# Experiment Summary
+
+```{r get_data}
+samples_1 <- paste0("Eickelberg_", 
+                  c("B6B6_1",
+                    "B6B6_2",
+                    "B6B6_3",
+                    "HLAB6_2", 
+                    "HLAB6_3"))
+
+samples_2 <- c(
+  "1_B_65_11152018",
+  "1_B6_B6_11132018",
+  "2_HLA_5_11152018")
+
+samples <- c(samples_1, samples_2)
+
+sample_paths <- file.path(data_dir,
+                          samples,
+                          "outs", 
+                          "filtered_feature_bc_matrix")
+
+names(sample_paths) <- c(str_remove(samples_1, "Eickelberg_"),
+                         "B6B6_5",
+                         "B6B6_4",
+                         "HLAB6_5")
+
+mat <- Read10X(sample_paths)
+```
+
+## General QC for library prep  {.tabset}
+
+```{r }
+metrics_paths <- file.path(data_dir,
+                          samples,
+                          "outs", 
+                          "metrics_summary.csv")
+
+names(metrics_paths) <- str_remove(samples, "Eickelberg_")
+
+mapping_dat <- map_dfr(metrics_paths, read_csv, .id = "sample")
+
+clean_up_metadata <- function(metrics_summary) {
+  metrics_summary <- mutate_all(metrics_summary, str_remove, "%$")
+  metrics_summary <- mutate_at(metrics_summary, .vars= 2:ncol(metrics_summary), as.numeric)
+  metrics_summary
+}
+
+mapping_dat <- clean_up_metadata(mapping_dat)
+
+metrics <- colnames(mapping_dat)[2:ncol(mapping_dat)]
+
+mapping_dat <- mapping_dat %>% 
+  gather(metric, value, -sample) %>%
+  mutate(sample = factor(sample, levels = unique(sample)))
+
+p <- map(metrics, 
+    function(x) {
+    filter(mapping_dat, metric == x) %>% 
+          ggplot(aes(sample, value)) +
+            geom_point(aes(color = sample)) +
+        scale_color_brewer(palette = "Paired") + 
+        labs(y = x, 
+             x = "") +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+}) 
+```
+
+```{r, results ='asis'}
+
+for(i in seq_along(p)){
+  cat('\n### ', metrics[i], '\n')
+  print(p[i])
+  cat('\n')
+}
+```
+
+
+## Preprocessing {.tabset}
+
+
+## Rerun preprocessing scaling, PCA, UMAP, etc. 
+    
+```{r create_seurat, message = F, results = 'hide', warning = F}
+
+so <- CreateSeuratObject(
+  mat,
+  min.cells = 3,
+  min.features = 200,
+  names.delim = "_",
+  names.field = c(1,2)
+)
+
+so <- PercentageFeatureSet(so, 
+                             pattern = "^mt-", 
+                             col.name = "percent.mt")
+
+so@meta.data <- so@meta.data %>% 
+  tibble::rownames_to_column("cell") %>% 
+  mutate(condition = str_remove(orig.ident, "_[0-9]")) %>% 
+  as.data.frame() %>% 
+  tibble::column_to_rownames("cell")
+```
+
+### Percent Mitochondrial UMIs 
+
+```{r}
+plot_violin(so@meta.data, 
+            "orig.ident",
+            "percent.mt",
+            .fill = "condition") +
+  labs(x = "", y = "Percent UMIs from Mitochondria")
+```
+
+
+### # of genes detected 
+
+```{r}
+plot_violin(so@meta.data,
+            "orig.ident", 
+            "nFeature_RNA",
+            .fill = "condition") +
+  labs(x = "", y = "# of genes per cell")
+```
+
+
+### # of UMIs detected
+
+```{r}
+plot_violin(so@meta.data, 
+            "orig.ident",
+            "nCount_RNA", 
+            .fill = "condition") +
+  labs(x = "", y = "# of UMIs") 
+```
+
+### Table of mitochondrial proportions per sample
+
+```{r}
+so@meta.data %>% 
+  group_by(orig.ident) %>% 
+  summarize(median_percent_mito = median(percent.mt), 
+            mean_percent_mito = mean(percent.mt)) %>% 
+  arrange(desc(median_percent_mito))
+
+```
+
+
+## Relationship between UMIs and % mitochondria {.tabset}
+
+### All samples
+
+```{r, fig.width = 24, fig.height = 18}
+sample_names <- as.character(unique(so@meta.data$orig.ident))
+per_sample <- map(sample_names, ~filter(so@meta.data, 
+                                        orig.ident == .x))
+p <- list()
+for(i in seq_along(per_sample)){
+  .col <- discrete_palette_default[i]
+  p[[i]] <- ggplot(per_sample[[i]], aes(nCount_RNA, percent.mt)) +
+        geom_point(aes(color = condition)) +
+        scale_color_manual(values = .col)
+}
+
+plot_grid(plotlist= p, nrow = 2, ncol = 3)
+```
+
+```{r, results ='asis'}
+
+for(i in seq_along(per_sample)){
+  .col <- discrete_palette_default[i]
+  cat('\n### ', sample_names[i], '\n')
+  p <- ggplot(per_sample[[i]], aes(nCount_RNA, percent.mt)) +
+        geom_point(aes(color = condition)) +
+        scale_color_manual(values = .col)
+  print(p)
+  cat('\n')
+}
+```
+
+
+## Filter cells and samples.
+
+Annotate samples and assign colors to each sample. 
+
+```{r}
+annots <- so@meta.data %>% 
+  select(orig.ident, condition) %>% 
+  unique() %>%
+  arrange(condition)
+
+subgroup_order <- c(
+  "B6B6",
+  "HLAB6"
+)
+
+annots <- mutate(annots, condition = factor(condition, levels = subgroup_order))
+
+sample_order <- annots$orig.ident 
+
+so@meta.data$orig.ident <- factor(so@meta.data$orig.ident, levels = sample_order)
+so@meta.data$condition <- factor(so@meta.data$condition, levels = subgroup_order)
+
+```
+
+
+## Normalize and embed into 2D with UMAP
+
+```{r}
+so <- NormalizeData(so)
+
+so <- FindVariableFeatures(
+  so,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+so <- ScaleData(so, verbose = TRUE)
+
+so <- RunPCA(so, 
+             npcs = 100, 
+             verbose = FALSE)
+
+ElbowPlot(so, ndims = 100)
+
+# make graphs and use graphs for UMAP
+so <- FindNeighbors(so, 
+                      reduction = "pca", 
+                      dims = 1:30, 
+                      k.param = 20L)
+
+
+so <- RunUMAP(so, 
+              graph = "RNA_snn", 
+              min.dist = 0.3)
+
+so <- FindClusters(so, 
+                   resolution = c(0.05, 0.075, 0.1, 0.3, 0.5))
+
+so$coarse_clusters <- so$RNA_snn_res.0.075
+
+Idents(so) <- "coarse_clusters"
+
+plot_umap(so, "coarse_clusters")
+```
+
+```{r}
+plot_umap(so, "condition", .col = palette_OkabeIto)
+plot_umap(so, "coarse_clusters", label_text = TRUE, label_col = "black")
+plot_umap(so, "orig.ident")
+```
+
+
+## markers 
+
+
+### Cluster markers
+
+```{r markers of each subgroup}
+mkrs <- wilcoxauc(so, "coarse_clusters")
+
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE)
+
+mkrs %>% 
+  write_tsv(file.path(mkrs_dir, "coarse_cluster_markers_all_data.tsv"))
+
+mkrs %>% 
+  ungroup() %>% 
+  split(., .$group) %>% 
+  write_markers_xlsx(.,
+                     file.path(tbls_dir,
+                               "coarse_cluster_markers_all_data.xlsx"))
+```
+
+```{r, fig.width = 20, fig.height= 20}
+topx <- mkrs %>% 
+  ungroup() %>% 
+  mutate(group = factor(as.numeric(group))) %>% 
+  arrange(group) %>% 
+  group_by(group) %>% 
+  top_n(10, logFC) 
+
+p <- DotPlot(so, 
+        features = unique(topx$feature),
+        group.by = "coarse_clusters") +
+  coord_flip() +
+  labs(x = "Cluster",
+       y = "")
+
+p
+
+save_plot(file.path(fig_dir, 
+                    "coarse_cluster_marker_dotplot.pdf"), 
+          p, base_height = 24, base_asp = 1)
+```
+
+
+
+## Try to assign cell types using cell atlas data
+
+The [`Tabula Muris`](https://tabula-muris.ds.czbiohub.org/) is a collection of single cell dataset from 20 organs. 
+
+We will use the gene expression profiles from these datasets to try to assign cell types to the identified clusters. The `clustifyr` package will correlate experession in our clusters to the tabula muris and report the most correlated cell type. It's unlikely that these will be 100% correct, because I don't believe that the tabula muris will have all of the cell types in a mouse, and I don't believe hat they have cells from developing tissues. Nevertheless it will give us a good starting point to annotating the cell types. 
+
+```{r, fig.width=8, fig.height=12}
+library(clustifyr)
+library(ComplexHeatmap)
+
+tm_average <- readRDS("/Users/kriemo/Projects/sc_repos/vanotterloo/data/tabula_muris/TM_avg_expr.rds")
+
+mdata <- get_metadata(so)
+
+res <- clustify(so@assays$RNA@data, 
+                tm_average, 
+                query_genes = so@assays$RNA@var.features,
+                metadata = mdata, 
+                cluster_col = "coarse_clusters", 
+                compute_method = "spearman")
+
+hmap <- Heatmap(t(res), 
+                viridis::viridis(256), 
+                "Spearman\ncorrelation",
+                row_title = "Cell types from Tabula Muris",
+                column_title = "Clusters")
+  
+pdf(file.path(fig_dir, "cell_type_heatmap.pdf"), height = 12, width = 12)
+draw(hmap)
+dev.off()
+
+hmap
+
+
+so$cell_types <- call_to_metadata(cor_to_call(res, 
+                             metadata = mdata, 
+                             cluster_col = "coarse_clusters", threshold = 0.5),
+                 metadata = mdata,
+                 cluster_col = "coarse_clusters") %>% 
+  pull(type)
+
+# manually annotation Mzb1+ cells
+
+so$cell_types <- ifelse(so$coarse_clusters == "11", 
+                        "B cell Mzb1+",
+                        so$cell_types)
+```
+
+
+```{r}
+pclusters <- plot_umap(so, "coarse_clusters")
+pcell_types <- plot_umap(so, "cell_types")
+
+plt <- plot_grid(pclusters, pcell_types)
+plt
+save_plot(file.path(fig_dir,"umap_by_cell_type.pdf"),
+          plt, nrow = 1, ncol = 2, base_asp = 1.75)
+```
+
+## Save 
+
+```{r}
+qsave(so, file.path(object_dir, "so.qs"))
+rm(so); gc()
+```
+
+```{r, eval = FALSE}
+so <- qread(file.path(object_dir, "so.qs"))
+```
+
+
+## Decontamination with SoupX
+
+```{r}
+library(SoupX)
+
+soup_genes <- list(
+  HB = c("Hbb-bs", "Hba-a1", "Hba-a2", "Hbb-bt", "H2-Ab1", "H2-Aa", "H2-Ab1", "H2-Eb1"),
+  Club = c("Scgb1a1"),
+  Bcell = c("Cd74", "Ighg2c", "Igkc", "Ighm", "Ighg3"),
+  AEC2 = c("Sftpc"),
+  MAC = c("Apoe", "Lyz2", "Psap" ),
+  OTHER = c("Ly6c1", "Ly6a" )
+)
+
+ids <- names(sample_paths)
+dataDirs <- file.path(data_dir, samples, "outs")
+
+mats <- list()
+for(i in seq_along(dataDirs)){
+  id <- ids[i]
+  tmp <- subset(so, subset = orig.ident == id)
+  # recluster each sample independently (avoids singletons)
+  tmp <- ScaleData(tmp) %>% 
+    FindNeighbors(.) %>% 
+    FindClusters(resolution = 0.8)
+  
+  dr <- Embeddings(tmp, "umap")
+  rownames(dr) <- str_remove(rownames(dr),
+                             str_c(id, "_"))
+  
+  mdata <- tmp@meta.data
+  rownames(mdata) <- str_remove(rownames(mdata),
+                                str_c(id, "_"))
+  
+  sc <- load10X(dataDirs[i], cellIDs = rownames(dr))
+  
+  sc <-  setDR(sc, dr)
+  sc <- setClusters(sc, as.numeric(as.character(mdata$seurat_clusters)))
+  
+  plotMarkerDistribution(sc)
+  useToEst <-  estimateNonExpressingCells(sc, 
+                                          nonExpressedGeneList = soup_genes)
+  sc <- calculateContaminationFraction(sc, 
+                                       soup_genes, 
+                                       useToEst = useToEst)
+  
+  out <- adjustCounts(sc, 
+                      roundToInt=TRUE, 
+                      verbose = 2, 
+                      method = 'subtraction',
+                      nCores = 3)
+  mats[[i]] <- out
+}
+
+names(mats) <- names(sample_paths)
+
+mats_cpy <- mats
+
+for(i in seq_along(mats_cpy)){
+  cnames <- colnames(mats_cpy[[i]])
+  colnames(mats_cpy[[i]]) <- str_c(names(mats_cpy)[i], 
+                                   "_",
+                                   cnames)
+}
+
+mats_cpy <- do.call(cbind, mats_cpy)[rownames(so), colnames(so)]
+
+qsave(mats, file.path(object_dir, "souped_matrices.qs"))
+```
+
+## renormalize/cluster/embed via seurat
+
+```{r}
+
+cell_types <- so$cell_types
+so <- CreateSeuratObject(counts = mats_cpy, 
+                         names.field = c(1, 2))
+
+so$cell_types <- cell_types
+so$condition <- str_remove(so$orig.ident, "_[0-9]$")
+so <- NormalizeData(so)
+
+so <- FindVariableFeatures(
+  so,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+so <- ScaleData(so, verbose = TRUE)
+
+so <- RunPCA(so, 
+             npcs = 100, 
+             verbose = FALSE)
+
+ElbowPlot(so, ndims = 100)
+
+# make graphs and use graphs for UMAP
+so <- FindNeighbors(so, 
+                      reduction = "pca", 
+                      dims = 1:30, 
+                      k.param = 20L)
+
+
+so <- RunUMAP(so, 
+              graph = "RNA_snn", 
+              min.dist = 0.3)
+
+so <- FindClusters(so, 
+                   resolution = c(0.05, 0.075, 0.1, 0.3, 0.5))
+
+so$coarse_clusters <- so$RNA_snn_res.0.1
+
+Idents(so) <- "coarse_clusters"
+
+plot_umap(so, "coarse_clusters")
+plot_umap(so, "cell_types")
+```
+
+Assign cell types to souped data
+
+```{r}
+library(clustifyr)
+library(ComplexHeatmap)
+
+tm_average <- readRDS("/Users/kriemo/Projects/sc_repos/vanotterloo/data/tabula_muris/TM_avg_expr.rds")
+
+mdata <- get_metadata(so)
+
+res <- clustify(so@assays$RNA@data, 
+                tm_average, 
+                query_genes = so@assays$RNA@var.features,
+                metadata = mdata, 
+                cluster_col = "coarse_clusters", 
+                compute_method = "spearman")
+
+hmap <- Heatmap(t(res), 
+                viridis::viridis(256), 
+                "Spearman\ncorrelation",
+                row_title = "Cell types from Tabula Muris",
+                column_title = "Clusters")
+  
+pdf(file.path(fig_dir, "cell_type_heatmap_soupx.pdf"), height = 12, width = 12)
+draw(hmap)
+dev.off()
+
+hmap
+
+
+so$cell_types <- call_to_metadata(cor_to_call(res, 
+                             metadata = mdata, 
+                             cluster_col = "coarse_clusters", threshold = 0.5),
+                 metadata = mdata,
+                 cluster_col = "coarse_clusters") %>% 
+  pull(type)
+
+# manually annotation Mzb1+ cells
+
+so$cell_types <- ifelse(so$coarse_clusters == "11", 
+                        "B cell Mzb1+",
+                        so$cell_types)
+```
+
+
+
+```{r}
+to_plot <- c(
+  "coarse_clusters",
+  "cell_types",
+  "condition",
+  "orig.ident"
+) 
+
+plt <- map(to_plot, 
+    ~plot_umap(so, .x)) %>% 
+  plot_grid(plotlist = ., nrow = 1, ncol =4,
+            rel_widths = c(1.2, 2, 1.2, 1.2))
+
+plt
+save_plot(file.path(fig_dir,
+                         paste0("umap_summary_soupx.pdf")),
+                plt,
+          nrow = 1, 
+          ncol = 4,
+          base_asp = 1.2)
+
+plt
+```
+## markers 
+
+
+### Cluster markers
+
+```{r markers of each subgroup}
+mkrs <- wilcoxauc(so, "coarse_clusters")
+
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE)
+
+mkrs %>% 
+  write_tsv(file.path(mkrs_dir, "coarse_cluster_markers_all_data_soupx.tsv"))
+
+mkrs %>% 
+  ungroup() %>% 
+  split(., .$group) %>% 
+  write_markers_xlsx(.,
+                     file.path(tbls_dir,
+                               "coarse_cluster_markers_all_data_soupx.xlsx"))
+```
+
+
+## Summary UMAPs
+
+
+```{r}
+to_plot <- c(
+  "coarse_clusters",
+  "cell_types",
+  "condition"
+) 
+
+plt <- map(to_plot, 
+    ~plot_umap(so, .x)) %>% 
+  plot_grid(plotlist = ., nrow = 1, ncol =3)
+
+plt
+
+save_plot(file.path(fig_dir,
+                         paste0("umap_summary_soupx.pdf")),
+                plt,
+                base_asp = 1.2)
+```
+
+
+## Overlay human HLA-A2 expression
+
+```{r, fig.width = 12}
+count_path <- file.path(proj_dir, 
+                        "data",
+                        "cellranger",
+                        "hlaa2_mapping")
+count_files <- file.path(count_path, paste0(samples, "_counts.txt"))
+
+all(map_lgl(count_files, file.exists))
+
+names(count_files) <- c(str_remove(samples_1, "Eickelberg_"),
+                         "B6B6_5",
+                         "B6B6_4",
+                         "HLAB6_5")
+
+hla_counts <- map_dfr(count_files, read_tsv,
+                  col_names = c("cell", "hla_counts"),
+                  .id = "sample") %>% 
+  mutate(cell = paste0(sample, "_", cell))
+
+
+so$hla_counts <- left_join(rownames_to_column(so@meta.data,
+                                              "cell"),
+                           hla_counts) %>% 
+  mutate(hla_counts = ifelse(is.na(hla_counts),
+                             0L,
+                             hla_counts),
+         hla_counts = log1p(1e4 * (hla_counts / nCount_RNA))) %>% 
+  pull(hla_counts)
+  
+
+plot_umap(so, "cell_types")
+
+plot_umap(so, "hla_counts")
+
+so@meta.data %>% 
+  ggplot(aes(cell_types, hla_counts)) +
+  geom_violin(aes(fill = condition)) +
+  geom_jitter(aes(color = condition)) + 
+  theme(axis.text.x = element_text(angle = 90))
+
+p <- plot_features_split(so, "hla_counts", "condition") %>% 
+  plot_grid(plotlist = .)
+
+save_plot(file.path(fig_dir, "human_hla_tg_umaps.pdf"), 
+          p,
+          nrow = 1, ncol = 2)
+
+```
+
+
+```{r}
+qsave(so, file.path(object_dir, "so_souped.qs"))
+```
+
+```{r}
+get_metadata(so) %>% 
+  mutate(new_cell_id = ifelse(str_starts(cell, "B6B6") | str_starts(cell,
+                                                 "HLA"),
+                              str_c("Eickelberg_", cell),
+                              cell)) %>% 
+  write_tsv(file.path(tbls_dir, "bg_corrected_metadata.tsv.gz"))
+
+```
+
+## Subcluster endothelial cells
+
+```{r}
+endo_cells <- c(
+  "lung endothelial cell"
+)
+
+so_endo <- subset(so, 
+                    subset = cell_types %in% endo_cells)
+plot_umap(so_endo, "coarse_clusters")
+
+so_endo <- NormalizeData(so_endo)
+
+so_endo <- FindVariableFeatures(
+  so_endo,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+so_endo <- ScaleData(so_endo, verbose = TRUE)
+
+so_endo <- RunPCA(so_endo, 
+             npcs = 100, 
+             verbose = FALSE)
+
+ElbowPlot(so_endo, ndims = 100)
+
+# make graphs and use graphs for UMAP
+so_endo <- FindNeighbors(so_endo, 
+                      reduction = "pca", 
+                      dims = 1:20, 
+                      k.param = 20L)
+
+so_endo <- RunUMAP(so_endo, 
+              graph = "RNA_snn", 
+              min.dist = 0.5)
+plot_umap(so_endo, "condition")
+
+plot_umap(so_endo, "orig.ident")
+
+res_to_test <-  c(0.1, 0.2, 0.3, 0.5)
+so_endo <- FindClusters(so_endo, 
+                   resolution = res_to_test)
+
+map(paste0("RNA_snn_res.", res_to_test),
+    ~plot_umap(so_endo, .x))
+
+so_endo$refined_clusters <- so_endo$RNA_snn_res.0.3
+
+Idents(so_endo) <- "refined_clusters"
+
+
+plot_umap(so_endo, "refined_clusters")
+
+
+```
+
+```{r}
+mkrs <- wilcoxauc(so_endo, "refined_clusters")
+
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE)
+
+mkrs %>% 
+  write_tsv(file.path(mkrs_dir, "endothelial_subcluster_markers.tsv"))
+
+mkrs %>% 
+  ungroup() %>% 
+  split(., .$group) %>% 
+  write_markers_xlsx(.,
+                     file.path(tbls_dir,
+                               "endothelial_subcluster_markers.xlsx"))
+
+```
+
+
+```{r}
+mkrs <- read_tsv(file.path(mkrs_dir,
+                           "endothelial_subcluster_markers.tsv"))
+
+topx <- mkrs %>% 
+  ungroup() %>% 
+  mutate(group = factor(as.numeric(group))) %>% 
+  arrange(group) %>% 
+  group_by(group) %>% 
+  top_n(10, logFC) 
+```
+
+
+
+```{r, fig.width = 10, fig.height= 10}
+
+p <- DotPlot(so_endo, 
+        features = unique(topx$feature),
+        group.by = "refined_clusters") +
+  coord_flip() +
+  labs(x = "Cluster",
+       y = "")
+
+p
+
+save_plot(file.path(fig_dir, 
+                    "endothelial_subcluster_marker_dotplot.pdf"), 
+          p, base_height = 24, base_asp = 1)
+```
+
+```{r}
+so_endo <- calc_diversity(so_endo, "orig.ident", "refined_clusters")
+
+plot_umap(so_endo, "entropy")
+```
+
+Remove cluster X (single sample)
+```{r}
+p1 <- plot_umap(so_endo, "orig.ident")
+p2 <- plot_umap(so_endo, "refined_clusters")
+
+p <- plot_grid(p1, p2, nrow = 1,ncol = 2)
+p
+
+```
+
+
+```{r}
+so_endo$cluster_condition <- str_c(so_endo$condition,
+                              "_",
+                              so_endo$refined_clusters)
+
+clusters_to_test <- sort(unique(so_endo$refined_clusters))
+
+#clusters_to_test <- clusters_to_test[clusters_to_test != "7"]
+
+Idents(so_endo) <- "cluster_condition"
+mkrs <- list()
+for (i in seq_along(clusters_to_test)){
+  message(clusters_to_test[i]) 
+  mkrs[[i]] <- FindMarkers(so_endo, 
+              ident.1 = str_c("HLAB6_", clusters_to_test[i]),
+              ident.2 = str_c("B6B6_", clusters_to_test[i]), 
+              only.pos = FALSE)
+}
+
+names(mkrs) <- clusters_to_test
+
+mkrs <- map(mkrs, ~tibble::rownames_to_column(.x, "gene"))
+mkrs <- bind_rows(mkrs, .id = "cluster")
+mkrs <- filter(mkrs,  p_val_adj < 0.01)
+write_tsv(mkrs, 
+          file.path(mkrs_dir, "endothelial_subcluster_deg_conditions.tsv"))
+
+```
+
+
+```{r}
+qsave(so_endo, file.path(object_dir, "so_endo.qs"))
+```
+
+
+## Subcluster b-cells + Mzb1 b-cells
+
+```{r}
+b_cells <- c(
+  "B cell",
+  "B cell Mzb1+"
+)
+
+so_bcells <- subset(so, 
+                    subset = cell_types %in% b_cells)
+plot_umap(so_bcells, "coarse_clusters")
+
+so_bcells <- NormalizeData(so_bcells)
+
+so_bcells <- FindVariableFeatures(
+  so_bcells,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+so_bcells <- ScaleData(so_bcells, verbose = TRUE)
+
+so_bcells <- RunPCA(so_bcells, 
+             npcs = 100, 
+             verbose = FALSE)
+
+ElbowPlot(so_bcells, ndims = 100)
+
+# make graphs and use graphs for UMAP
+so_bcells <- FindNeighbors(so_bcells, 
+                      reduction = "pca", 
+                      dims = 1:20, 
+                      k.param = 20L)
+
+so_bcells <- RunUMAP(so_bcells, 
+              graph = "RNA_snn", 
+              min.dist = 0.45)
+
+so_bcells <- FindClusters(so_bcells, 
+                   resolution = c(0.1, 0.15, 0.2, 0.3, 0.5))
+
+so_bcells$refined_clusters <- so_bcells$RNA_snn_res.0.5
+so_bcells$coarse_clusters <- so_bcells$RNA_snn_res.0.15
+
+Idents(so_bcells) <- "refined_clusters"
+
+plot_umap(so_bcells, "condition")
+plot_umap(so_bcells, "refined_clusters")
+plot_umap(so_bcells, "coarse_clusters")
+plot_umap(so_bcells, "cell_types")
+
+```
+
+
+```{r}
+mkrs <- wilcoxauc(so_bcells, "refined_clusters")
+
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE)
+
+mkrs %>% 
+  write_tsv(file.path(mkrs_dir, "bcells_mzb1_markers_refined_clusters.tsv"))
+
+mkrs <- wilcoxauc(so_bcells, "coarse_clusters")
+
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE)
+
+mkrs %>% 
+  write_tsv(file.path(mkrs_dir, "bcells_mzb1_markers_coarse_clusters.tsv"))
+```
+
+```{r}
+get_metadata(so_bcells) %>% 
+  mutate(new_cell_id = ifelse(str_starts(cell, "B6B6") | str_starts(cell,
+                                                 "HLA"),
+                              str_c("Eickelberg_", cell),
+                              cell)) %>% 
+  write_tsv(file.path(tbls_dir, "bcells_mzb1_bg_corrected_metadata.tsv.gz"))
+```
+
+```{r}
+to_plot <- c(
+  "orig.ident",
+  "condition",
+  "cell_types",
+  "Mzb1",
+  "coarse_clusters",
+  "refined_clusters"
+) 
+
+plt <- map(to_plot, 
+    ~plot_umap(so_bcells, .x)) %>% 
+  plot_grid(plotlist = ., nrow = 3, ncol = 2)
+
+
+save_plot(file.path(fig_dir,
+                         paste0("mzb_bcell_umap_summary.pdf")),
+                plt, nrow = 3, ncol = 2,
+                base_asp = 1.2)
+```
+
+```{r}
+qsave(so_bcells, file.path(object_dir, "bcell_subclustering.qs"))
+```
