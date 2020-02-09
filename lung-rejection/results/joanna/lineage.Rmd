@@ -1,0 +1,342 @@
+---
+title: "shazam test"
+author: "Kent Riemondy RBI"
+date: "4/7/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{bash}
+BIN="$HOME/Library/Python/3.7/bin/"
+DBASES="$HOME/Projects/sc_repos/eickelberg/dbases"
+run_changeo () {
+  outfile=$1
+  outfile_prefix=${outfile/.txz/}
+  echo $outfile
+  $BIN/MakeDb.py imgt \
+    -i $1 \
+    -s $2 \
+    --regions \
+    --scores
+    
+  $BIN/ParseDb.py split \
+    -d $outfile_prefix"_db-pass.tab" \
+    -f FUNCTIONAL
+    
+  $BIN/CreateGermlines.py \
+    -d $outfile_prefix"_db-pass_FUNCTIONAL-T.tab" \
+    -g dmask \
+    -r $DBASES/IGHV.fasta $DBASES/IGHD.fasta $DBASES/IGHJ.fasta
+
+}
+
+run_changeo \
+  "../data/20181206/CD20_3_Bcell_enriched/imgt.txz" \
+  "../data/20181206/CD20_3_Bcell_enriched/consensus.fasta"
+  
+run_changeo \
+  "../data/20181206/CD138_3_Bcell_enriched/imgt.txz" \
+  "../data/20181206/CD138_3_Bcell_enriched/consensus.fasta"
+  
+run_changeo \
+  "../data/20181126/CD138-02_VDJ_B_cell_Enriched/imgt.txz" \
+  "../data/20181126/CD138-02_VDJ_B_cell_Enriched/consensus.fasta"
+  
+run_changeo \
+  "../data/10x_data/pbmcs/imgt.txz" \
+  "../data/10x_data/pbmcs/consensus.fasta"
+```
+
+```{r}
+library(alakazam)
+library(shazam)
+library(tigger)
+library(tidyverse)
+library(cowplot)
+theme_set(theme_cowplot())
+```
+
+```{r}
+changeofiles <- c(
+  cd138_expt2 = "../data/20181126/CD138-02_VDJ_B_cell_Enriched/imgt_db-pass_FUNCTIONAL-T_germ-pass.tab",
+  cd138_expt3 = "../data/20181206/CD138_3_Bcell_enriched/imgt_db-pass_FUNCTIONAL-T_germ-pass.tab",
+  cd20_expt3 = "../data/20181206/CD20_3_Bcell_enriched/imgt_db-pass_FUNCTIONAL-T_germ-pass.tab",
+  pbmcs = "../data/10x_data/pbmcs/imgt_db-pass_FUNCTIONAL-T_germ-pass.tab")
+co <- map(changeofiles, ~readChangeoDb(.x, select = NULL, drop = NULL, seq_upper = TRUE))
+
+co <- bind_rows(co[c(2, 3, 4)], .id = "SAMPLE")
+
+```
+
+```{r}
+ighv <- "~/Projects/sc_repos/eickelberg/dbases/IGHV.fasta"
+co$V_CALL <- str_remove_all(co$V_CALL, "Homsap ") %>% 
+  str_remove_all(" F")
+novel <- findNovelAlleles(co, readIgFasta(ighv), germline_min = 10, nproc=1)
+plotNovel(SampleDb, novel[1, ])
+
+geno <- inferGenotype(co, germline_db=GermlineIGHV, novel=novel,
+                      find_unmutated=TRUE)
+# Save the genotype sequences to a vector
+genotype_db <- genotypeFasta(geno, readIgFasta(ighv), novel)
+# Visualize the genotype and sequence counts
+print(geno)
+plotGenotype(geno, text_size = 10)
+
+co <- reassignAlleles(co, genotype_db)
+
+not_in_genotype <- co$V_CALL %>%
+    strsplit(",") %>%
+    unlist() %>%
+    unique() %>%
+    setdiff(names(genotype_db))
+
+# Determine the fraction of calls that were ambigious before/after correction
+# and the fraction that contained original calls to non-genotype alleles. Note
+# that by design, only genotype alleles are allowed in "after" calls.
+data.frame(Ambiguous=c(mean(grepl(",", co$V_CALL)),
+                       mean(grepl(",", co$V_CALL_GENOTYPED))),
+           NotInGenotype=c(mean(co$V_CALL %in% not_in_genotype),
+                           mean(co$V_CALL_GENOTYPED %in% not_in_genotype)),
+           row.names=c("Before", "After")) %>% 
+    t() %>% round(3)
+
+
+```
+
+```{r}
+dist_ham <- distToNearest(co, vCallColumn="V_CALL_GENOTYPED", 
+                          model="ham", normalize="len", nproc=1, 
+                          fields = "SAMPLE", first = FALSE)
+dist_aa <- distToNearest(co, vCallColumn="V_CALL_GENOTYPED", 
+                          model="aa", normalize="len", nproc=1, fields = "SAMPLE", 
+                         first = FALSE)
+
+# Use a 5-mer model and no normalization
+dist_s5f <- distToNearest(co, vCallColumn="V_CALL_GENOTYPED", 
+                          model="hh_s5f", normalize="none", nproc=1, fields = "SAMPLE",
+                          first = FALSE)
+
+dist_s1f <- distToNearest(co, vCallColumn="V_CALL_GENOTYPED", 
+                          model="hh_s1f", normalize="none", nproc=1, fields = "SAMPLE",
+                          first = FALSE)
+
+p1 <- ggplot(filter(dist_ham, !is.na(DIST_NEAREST)),
+             aes(x=DIST_NEAREST)) + 
+    theme_bw() + 
+    xlab("Hamming distance") + 
+    ylab("Count") +
+    scale_x_continuous(breaks=seq(0, 1, 0.1)) +
+    geom_histogram(color="white", binwidth=0.02) +
+  facet_grid(SAMPLE ~ ., scales="free_y") +
+  labs(title = "Hamming distance (nt)")
+
+p2 <- ggplot(filter(dist_aa, !is.na(DIST_NEAREST)),
+             aes(x=DIST_NEAREST)) + 
+    theme_bw() + 
+    xlab("Hamming distance") + 
+    ylab("Count") +
+    scale_x_continuous(breaks=seq(0, 1, 0.1)) +
+    geom_histogram(color="white", binwidth=0.02) +
+  facet_grid(SAMPLE ~ ., scales="free_y") +
+  labs(title = "Hamming distance (aa)")
+
+p3 <- ggplot(filter(dist_s5f, !is.na(DIST_NEAREST)),
+             aes(x=DIST_NEAREST)) + 
+    theme_bw() + 
+    xlab("Hamming distance") + 
+    ylab("Count") +
+    geom_histogram(color="white", binwidth=1) +
+  facet_grid(SAMPLE ~ ., scales="free_y") +
+  labs(title = "Human heavy chain, silent, 5-mer, functional targeting  model")
+  
+ 
+p4 <- ggplot(filter(dist_s1f, !is.na(DIST_NEAREST)),
+             aes(x=DIST_NEAREST)) + 
+    theme_bw() + 
+    xlab("Hamming distance") + 
+    ylab("Count") +
+  #  scale_x_continuous(breaks=seq(0, 1, 0.1)) +
+    geom_histogram(color="white", binwidth=1) +
+  facet_grid(SAMPLE ~ ., scales="free_y") +
+  labs(title = "Human heavy chain, silent, 1-mer, functional substitution model")
+
+
+plt <- plot_grid(p1, p2, p3, p4, nrow = 2, ncol = 2)
+save_plot("repetoire_distances.pdf", plt, nrow = 2, ncol = 2 )
+```
+
+```{r}
+
+#https://shazam.readthedocs.io/en/version-0.1.11_a/vignettes/DistToNearest-Vignette/
+
+dist_ham <- map(co, ~distToNearest(.x, vCallColumn="V_CALL", 
+                          model="ham", normalize="len", nproc=1))
+dist_aa <- map(co, ~distToNearest(.x, vCallColumn="V_CALL", 
+                          model="aa", normalize="len", nproc=1))
+
+# Use a 5-mer model and no normalization
+dist_s5f <- map(co, ~distToNearest(.x, vCallColumn="V_CALL", 
+                          model="hh_s5f", normalize="none", nproc=1))
+
+ps <- imap(dist_ham, function(x, y){
+  p1 <- ggplot(filter(x, !is.na(DIST_NEAREST)),
+             aes(x=DIST_NEAREST)) + 
+    theme_bw() + 
+    xlab("Hamming distance") + 
+    ylab("Count") +
+    scale_x_continuous(breaks=seq(0, 1, 0.1)) +
+    geom_histogram(color="white", binwidth=0.02) +
+    geom_vline(xintercept=0.12, color="firebrick", linetype=2) +
+    labs(title = y)
+
+  p1
+})
+ps
+
+plt <- plot_grid(plotlist = ps, nrow = 1, ncol = 3)
+save_plot("hamming_dist.pdf", plt, nrow = 1, ncol =3 )
+```
+
+
+
+```{r}
+
+ps2 <- imap(dist_s5f, function(x, y){
+  p1 <- ggplot(filter(x, !is.na(DIST_NEAREST)),
+             aes(x=DIST_NEAREST)) + 
+    theme_bw() + 
+    xlab("HH_S5F distance") + 
+    ylab("Count") +
+    scale_x_continuous(breaks=seq(0, 50, 5)) +
+    geom_histogram(color="white", binwidth=1) +
+    geom_vline(xintercept=7, color="firebrick", linetype=2) +
+    labs(title = y)
+
+  p1
+})
+
+ps2
+
+plt <- plot_grid(plotlist = ps2, nrow = 1, ncol = 3)
+save_plot("kmer_dist.pdf", plt, nrow = 1, ncol =3 )
+
+# Find threshold using gmm method
+output <-findThreshold(dist_ham$cd20_expt3$DIST_NEAREST, method="gmm", model="gamma-gamma")
+
+# Plot distance histogram, Gaussian fits, and optimum threshold
+plot(output, binwidth=0.02, title="GMM Method: gamma-gamma")
+print(output)
+
+
+```
+
+```{bash}
+BIN="$HOME/Library/Python/3.7/bin/"
+
+run_clones () {
+  $BIN/DefineClones.py \
+  -d $1 \
+  --act set \
+  --model aa \
+  --norm len \
+  --dist $2
+}
+
+run_clones \
+  "../data/20181206/CD20_3_Bcell_enriched/imgt_db-pass_FUNCTIONAL-T_germ-pass.tab"   0.12273
+  
+run_clones \
+  "../data/10x_data/pbmcs/imgt_db-pass_FUNCTIONAL-T_germ-pass.tab" 0.12273
+```
+
+
+```{r}
+
+changeofile <- c(
+  cd20 = "../data/20181206/CD20_3_Bcell_enriched/imgt_db-pass_FUNCTIONAL-T_germ-pass_clone-pass.tab",
+  pbmc = "../data/10x_data/pbmcs/imgt_db-pass_FUNCTIONAL-T_germ-pass_clone-pass.tab")
+  
+
+co <- map_dfr(changeofile, ~readChangeoDb(.x, select = NULL, drop = NULL, seq_upper = TRUE), .id = "SAMPLE")
+
+clones <- countClones(co, groups = "SAMPLE")
+head(clones, 5)
+sub_db <- filter(co, CLONE == "361")
+clone <- makeChangeoClone(sub_db)
+
+
+dnapars_exec <- "/Users/kriemo/bin/phylip-3.695/exe/dnapars"
+graph <- buildPhylipLineage(clone, dnapars_exec, rm_temp=TRUE)
+
+library(igraph)
+data.frame(CLONE=graph$clone,
+           JUNCTION_LENGTH=graph$junc_len,
+           V_GENE=graph$v_gene,
+           J_GENE=graph$j_gene)
+
+data.frame(SEQUENCE_ID=V(graph)$name)
+
+
+plot(graph)
+
+
+V(graph)$color <- "steelblue"
+V(graph)$color[V(graph)$name == "Germline"] <- "black"
+V(graph)$color[grepl("Inferred", V(graph)$name)] <- "white"
+E(graph)$label <- ""
+
+# Remove large default margins
+par(mar=c(0, 0, 0, 0) + 0.1)
+# Plot graph
+plot(graph, layout=layout_as_tree, edge.arrow.mode=0, vertex.frame.color="black",
+     vertex.label.color="black", vertex.size=40)
+
+# Add legend
+legend("topleft", c("Germline", "Inferred", "Sample"), 
+       fill=c("black", "white", "steelblue"), cex=0.75)
+
+
+getPathLengths(graph, root="Germline")
+
+
+
+
+```
+
+
+
+```{r}
+annots <- read_csv("../data/cellranger/20181206_eickelberg/CD20_3_Bcell_enriched/outs/consensus_annotations.csv")
+```
+
+
+```{r}
+clones <- estimateAbundance(co, group="SAMPLE", ci=0.95, nboot=200)
+#sample_colors <- c("cd20"="seagreen", "pbmc"="steelblue")
+#plot(clones, colors=sample_colors, legend_title="Sample")
+
+sample_div <- rarefyDiversity(co, "SAMPLE", min_q=0, max_q=4, step_q=0.05,
+                              ci=0.95, nboot=200)
+
+isotype_div <- rarefyDiversity(co, "SAMPLE", min_n=5, min_q=0, max_q=4,
+                               step_q=0.05, ci=0.95, nboot=200)
+
+# Plot a log-log (log_q=TRUE, log_d=TRUE) plot of sample diversity
+# Indicate number of sequences resampled from each group in the title
+sample_main <- paste0("Sample diversity (n=", sample_div@n, ")")
+plot(sample_div, 
+    # colors=sample_colors, 
+     main_title=sample_main, 
+     legend_title="Sample")
+
+# Plot isotype diversity using default set of Ig isotype colors
+isotype_main <- paste0("Isotype diversity (n=", isotype_div@n, ")")
+plot(isotype_div, colors=IG_COLORS, main_title=isotype_main, 
+     legend_title="Isotype")
+```
