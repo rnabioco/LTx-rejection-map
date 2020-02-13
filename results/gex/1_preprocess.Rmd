@@ -2,8 +2,6 @@
 title: "Lung rejection scRNA-seq data preprocessing"
 author: "Kent Riemondy RBI"
 date: "`R Sys.Date()`"
-params:
-  ncores: 4
 output:
   html_document:
     toc: true
@@ -26,11 +24,6 @@ knitr::opts_chunk$set(cache.lazy = FALSE)
 
 ```{r libs, message=FALSE, warning=FALSE, echo=FALSE}
 source(here::here("R/utils.R"))
-library(future)
-
-plan("multicore", workers = 7)
-options(future.globals.maxSize = 2 * 1024 ^ 3)
-
 proj_dir <- here()
 data_dir <- file.path(proj_dir, "data", "cellranger", "results")
 doc_dir <- file.path(proj_dir, "docs")
@@ -701,9 +694,23 @@ save_plot(file.path(fig_dir, "human_hla_tg_umaps.pdf"),
 
 ```
 
+### Cell counts
+
+```{r}
+
+get_cell_count_matrix(so, "condition", "cell_types") %>% 
+    tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_all_cells_refined_cell_types_by_condition.csv"))
+
+
+get_cell_count_matrix(so, "orig.ident", "cell_types") %>% 
+    tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_all_cells_refined_cell_types_by_sample.csv"))
+```
 
 ```{r}
 qsave(so, file.path(object_dir, "so_souped.qs"))
+#so <- qread("objects/so_souped.qs")
 ```
 
 ```{r}
@@ -771,6 +778,44 @@ Idents(so_endo) <- "refined_clusters"
 
 plot_umap(so_endo, "refined_clusters")
 
+
+```
+
+
+```{r, fig.width=8, fig.height=12}
+library(clustifyr)
+library(ComplexHeatmap)
+
+tm_average <- readRDS("/Users/kriemo/Projects/sc_repos/vanotterloo/data/tabula_muris/TM_avg_expr.rds")
+
+mdata <- get_metadata(so_endo)
+
+res <- clustify(so_endo@assays$RNA@data, 
+                tm_average, 
+                query_genes = so_endo@assays$RNA@var.features,
+                metadata = mdata, 
+                cluster_col = "refined_clusters", 
+                compute_method = "spearman")
+
+hmap <- Heatmap(t(res), 
+                viridis::viridis(256), 
+                "Spearman\ncorrelation",
+                row_title = "Cell types from Tabula Muris",
+                column_title = "Clusters")
+  
+pdf(file.path(fig_dir, "endo_cell_cell_type_heatmap.pdf"), height = 12, width = 12)
+draw(hmap)
+dev.off()
+
+hmap
+
+
+so_endo$endo_cell_types <- call_to_metadata(cor_to_call(res, 
+                             metadata = mdata, 
+                             cluster_col = "refined_clusters", threshold = 0.5),
+                 metadata = mdata,
+                 cluster_col = "refined_clusters") %>% 
+  pull(type)
 
 ```
 
@@ -870,9 +915,29 @@ write_tsv(mkrs,
 
 ```
 
+### Cell counts
+
+```{r}
+
+get_cell_count_matrix(so_endo, "condition", "refined_clusters") %>% 
+    tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_endo_cells_refined_clusters_by_condition.csv"))
+
+
+get_cell_count_matrix(so_endo, "orig.ident", "refined_clusters") %>% 
+    tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_endo_cells_refined_clusters_by_sample.csv"))
+```
+
+## Try to assign cell types using cell atlas data
+
+
+
+
 
 ```{r}
 qsave(so_endo, file.path(object_dir, "so_endo.qs"))
+#so_endo <- qread("objects/so_endo.qs")
 ```
 
 
@@ -897,13 +962,15 @@ so_bcells <- FindVariableFeatures(
   verbose = FALSE
 )
 
-so_bcells <- ScaleData(so_bcells, verbose = TRUE)
+so_bcells <- ScaleData(so_bcells, 
+                   #    vars.to.regress = "nCount_RNA", 
+                       verbose = TRUE)
 
 so_bcells <- RunPCA(so_bcells, 
-             npcs = 100, 
+             npcs = 50, 
              verbose = FALSE)
 
-ElbowPlot(so_bcells, ndims = 100)
+ElbowPlot(so_bcells, ndims = 50)
 
 # make graphs and use graphs for UMAP
 so_bcells <- FindNeighbors(so_bcells, 
@@ -913,21 +980,19 @@ so_bcells <- FindNeighbors(so_bcells,
 
 so_bcells <- RunUMAP(so_bcells, 
               graph = "RNA_snn", 
-              min.dist = 0.45)
+              min.dist = 0.2)
 
 so_bcells <- FindClusters(so_bcells, 
                    resolution = c(0.1, 0.15, 0.2, 0.3, 0.5))
 
 so_bcells$refined_clusters <- so_bcells$RNA_snn_res.0.5
-so_bcells$coarse_clusters <- so_bcells$RNA_snn_res.0.15
+so_bcells$coarse_clusters <- so_bcells$RNA_snn_res.0.1
 
 Idents(so_bcells) <- "refined_clusters"
 
-plot_umap(so_bcells, "condition")
-plot_umap(so_bcells, "refined_clusters")
-plot_umap(so_bcells, "coarse_clusters")
-plot_umap(so_bcells, "cell_types")
-
+plot_umap(so_bcells, 
+          str_subset(colnames(so_bcells@meta.data),
+                                "res"))
 ```
 
 
@@ -938,18 +1003,154 @@ mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>%
   group_by(group) %>% 
   arrange(padj, desc(logFC), .by_group = TRUE)
 
+mkrs %>% slice(1:10)
+```
+
+cluster 6 looks like it is contaminated t-cells and/or doublets. Excluding
+
+```{r}
+excluded_cells <- get_metadata(so_bcells) %>% 
+  filter(refined_clusters == "6")
+write_tsv(excluded_cells, file.path(tbls_dir, "b_cell_subclustered_excluded_cells.tsv.gz"))
+
+so_bcells <- subset(so_bcells, subset = refined_clusters == "6", invert = TRUE)
+
+# recluster
+so_bcells <- FindVariableFeatures(
+  so_bcells,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+so_bcells <- ScaleData(so_bcells, verbose = TRUE)
+
+so_bcells <- RunPCA(so_bcells, 
+             npcs = 50, 
+             verbose = FALSE)
+
+ElbowPlot(so_bcells, ndims = 50)
+
+# make graphs and use graphs for UMAP
+so_bcells <- FindNeighbors(so_bcells, 
+                      reduction = "pca", 
+                      dims = 1:15, 
+                      k.param = 20L)
+
+so_bcells <- RunUMAP(so_bcells, 
+              graph = "RNA_snn", 
+              min.dist = 0.5)
+
+so_bcells <- FindClusters(so_bcells, 
+                   resolution = c(0.1, 0.15, 0.2, 0.3, 0.5, 0.6))
+
+so_bcells <- 
+plot_umap(so_bcells, 
+          str_subset(colnames(so_bcells@meta.data),
+                                "RNA_snn_res"))
+
+```
+```{r}
+Idents(so_bcells) <- "refined_clusters"
+
+so_bcells$refined_clusters <- so_bcells$RNA_snn_res.0.6
+so_bcells$coarse_clusters <- so_bcells$RNA_snn_res.0.15
+```
+
+
+```{r}
+mkrs <- wilcoxauc(so_bcells, "refined_clusters")
+
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05, pct_in > 10) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE)
+
 mkrs %>% 
   write_tsv(file.path(mkrs_dir, "bcells_mzb1_markers_refined_clusters.tsv"))
 
+mkrs %>% 
+  split(., .$group) %>% 
+  write_markers_xlsx(file.path(tbls_dir,
+                               "bcells_mzb1_markers_refined_clusters.xlsx"))
+
 mkrs <- wilcoxauc(so_bcells, "coarse_clusters")
 
-mkrs <- filter(mkrs, logFC > 0, padj < 0.05) %>% 
+mkrs <- filter(mkrs, logFC > 0, padj < 0.05, pct_in > 10) %>% 
   group_by(group) %>% 
   arrange(padj, desc(logFC), .by_group = TRUE)
 
 mkrs %>% 
   write_tsv(file.path(mkrs_dir, "bcells_mzb1_markers_coarse_clusters.tsv"))
+
+mkrs %>% 
+    split(., .$group) %>% 
+  write_markers_xlsx(file.path(tbls_dir,
+                               "bcells_mzb1_markers_coarse_clusters.xlsx"))
 ```
+
+### Cell counts
+
+```{r}
+get_cell_count_matrix(so_bcells, "condition", "coarse_clusters") %>% 
+  tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_b_cells_coarse_clusters_by_condition.csv"))
+
+get_cell_count_matrix(so_bcells, "condition", "refined_clusters") %>% 
+    tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_b_cells_refined_clusters_by_condition.csv"))
+
+get_cell_count_matrix(so_bcells, "orig.ident", "coarse_clusters") %>% 
+  tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_b_cells_coarse_clusters_by_sample.csv"))
+
+get_cell_count_matrix(so_bcells, "orig.ident", "refined_clusters") %>% 
+    tibble::rownames_to_column("condition") %>% 
+  write_csv(file.path(tbls_dir, "cell_counts_b_cells_refined_clusters_by_sample.csv"))
+```
+
+
+## Try to assign cell types using cell atlas data
+
+
+
+```{r, fig.width=8, fig.height=12}
+library(clustifyr)
+library(ComplexHeatmap)
+
+tm_average <- readRDS("/Users/kriemo/Projects/sc_repos/vanotterloo/data/tabula_muris/TM_avg_expr.rds")
+
+mdata <- get_metadata(so_bcells)
+
+res <- clustify(so_bcells@assays$RNA@data, 
+                tm_average, 
+                query_genes = so_bcells@assays$RNA@var.features,
+                metadata = mdata, 
+                cluster_col = "coarse_clusters", 
+                compute_method = "spearman")
+
+hmap <- Heatmap(t(res), 
+                viridis::viridis(256), 
+                "Spearman\ncorrelation",
+                row_title = "Cell types from Tabula Muris",
+                column_title = "Clusters")
+  
+pdf(file.path(fig_dir, "b_cell_cell_type_heatmap.pdf"), height = 12, width = 12)
+draw(hmap)
+dev.off()
+
+hmap
+
+
+so_bcells$b_cell_types <- call_to_metadata(cor_to_call(res, 
+                             metadata = mdata, 
+                             cluster_col = "coarse_clusters", threshold = 0.5),
+                 metadata = mdata,
+                 cluster_col = "coarse_clusters") %>% 
+  pull(type)
+
+```
+
+### Save
 
 ```{r}
 get_metadata(so_bcells) %>% 
@@ -970,8 +1171,7 @@ to_plot <- c(
   "refined_clusters"
 ) 
 
-plt <- map(to_plot, 
-    ~plot_umap(so_bcells, .x)) %>% 
+plt <- plot_umap(so_bcells, to_plot) %>% 
   plot_grid(plotlist = ., nrow = 3, ncol = 2)
 
 
@@ -983,4 +1183,5 @@ save_plot(file.path(fig_dir,
 
 ```{r}
 qsave(so_bcells, file.path(object_dir, "bcell_subclustering.qs"))
+#so_bcells <- qread(file.path(object_dir, "bcell_subclustering.qs"))
 ```
