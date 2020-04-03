@@ -1181,6 +1181,28 @@ save_plot(file.path(fig_dir,
                 base_asp = 1.2)
 ```
 
+
+### Cytotrace 
+
+```{r}
+mat <- as.matrix(so_bcells@assays$RNA@counts)
+source("../../R/CytoTRACE.R")
+a <- CytoTRACE(mat, ncores = 4)
+
+res <- tibble(
+  cell = names(a$GCS),
+  GCS = a$GCS,
+  CytoTRACE = a$CytoTRACE) %>% 
+  left_join(get_metadata(so_bcells), ., by = "cell") %>% 
+  select(cell, GCS, CytoTRACE) %>% 
+  mutate(GCS = ifelse(is.na(GCS), 0, GCS),
+         CytoTRACE = ifelse(is.na(CytoTRACE), -1, CytoTRACE)) %>% 
+  column_to_rownames("cell")
+
+so_bcells <- AddMetaData(so_bcells, res)
+```
+
+
 ```{r}
 qsave(so_bcells, file.path(object_dir, "bcell_subclustering.qs"))
 #so_bcells <- qread(file.path(object_dir, "bcell_subclustering.qs"))

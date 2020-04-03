@@ -1,0 +1,232 @@
+---
+title: "Pseudotime"
+author: "Kent Riemondy RBI"
+date: "`R Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: cosmo
+    highlight: tango
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(cache.lazy = FALSE)
+```
+
+
+```{r libs, message=FALSE, warning=FALSE, echo=FALSE}
+source(here::here("R/utils.R"))
+proj_dir <- here()
+data_dir <- file.path(proj_dir, "data", "cellranger", "results")
+doc_dir <- file.path(proj_dir, "docs")
+
+fig_dir <- "figs"
+mkrs_dir <- "markers"
+tbls_dir <- "tables"
+object_dir <- "objects"
+walk(c(fig_dir, mkrs_dir, tbls_dir, object_dir), 
+     dir.create, showWarnings = F)
+```
+
+## Run pseudotime
+
+It looks like the b-cells have a trajectory to produce the Mzb1+ cells. 
+
+```{r}
+so <- qread(file.path(object_dir, "bcell_subclustering.qs"))
+```
+
+
+## Check PCA
+
+```{r}
+plot_pca(so, c("coarse_clusters", "Mzb1"))
+```
+
+```{r}
+plot_umap(so, c("coarse_clusters", "Mzb1"))
+```
+Looks alright as Mzb1+ population separates along PC1. Next try diffusion maps. 
+
+## Check diffusion map
+
+```{r}
+library(destiny)
+
+logcounts <- GetAssayData(so, "data")
+
+# transpose matrix (genes as columns, cells as rows)
+input_matrix <- Matrix::t(logcounts[VariableFeatures(so), ])
+
+set.seed(42)
+dm <- DiffusionMap(as.matrix(input_matrix))
+
+plot(dm, 1:2, col = so$refined_clusters)
+
+dpt <- DPT(dm)
+
+plot(dpt)
+
+
+#important_genes <- gene_relevance(dm)
+```
+
+
+Looks alright but  similar to PCA, just use PCA for now
+
+## PCA based pseudotime
+
+```{r}
+ptime <- FetchData(so, "PC_1")
+
+ptime$ptime <- rank(-ptime$PC_1) 
+
+ptime$scaled_ptime <- ptime$ptime / max(ptime$ptime)
+
+# add to metadata
+so <- AddMetaData(so, 
+                    ptime$scaled_ptime, 
+                    col.name = "Pseudotime")
+
+plot_umap(so, "Pseudotime")
+```
+
+```{r}
+plot_trends <- function(so, feature) {
+get_metadata(so, feature) %>% 
+  ggplot(aes(Pseudotime, !!sym(feature))) + 
+    geom_point(aes(color = condition)) +
+    geom_smooth(aes(color = condition, group = condition),
+                method = "gam",
+                formula = y ~ s(x, bs = "cs"))
+  
+}
+
+to_plot <- c(
+  "Jchain",
+  "Mzb1"
+)
+map(res$id[1:30], ~plot_trends(so, .x))
+
+plot_trends(so, "Ell2")
+```
+
+## Find genes that change over pseudotime
+
+```{r}
+library(gam)
+cnts <- as.matrix(logcounts[VariableFeatures(so), ])
+
+ptime <- so$Pseudotime
+gam.pval <- apply(cnts, 1, function(z){
+    d <- data.frame(z = z, 
+                    ptime = ptime)
+    tmp <- suppressWarnings(gam(z ~ lo(ptime), data=d))
+    p <- summary(tmp)[4][[1]][1, 5]
+    p
+})
+
+# adjust pvalues 
+res <- tibble(
+  id = names(gam.pval),
+  pvals = gam.pval,
+  qval = p.adjust(gam.pval, method = "fdr")) %>% 
+  arrange(qval)
+
+head(res)
+
+# write out
+
+write_tsv(res, file.path(tbls_dir, "pseudotime_correlated_genes.tsv"))
+```
+
+
+```{r}
+library(ComplexHeatmap)
+
+#so_subset <- subset(so, subset = condition == "HLAB6")
+
+# get log normalized counts and top x genes changing over pseudotime
+to_plot <- as.matrix(GetAssayData(so, "data")[res$id[1:50], ])
+to_plot <- t(scale(t(to_plot)))
+
+# arrange cells by pseudotime
+ptime_order <- colnames(to_plot)[order(so$Pseudotime)]
+
+mdata <- so@meta.data[ptime_order, ]
+# add useful annotations
+annotations <- mdata[c("Pseudotime", 
+                            "coarse_clusters", 
+                            "condition")] %>% 
+  as.data.frame()
+
+to_plot <- to_plot[, ptime_order]
+
+ptime_cols <- circlize::colorRamp2(c(min(annotations$Pseudotime),
+                                   median(annotations$Pseudotime),
+                                   max(annotations$Pseudotime)),
+                                   rev(viridis::inferno(3)))
+
+cluster_cols <- palette_OkabeIto[1:length(levels(annotations$coarse_clusters))]
+names(cluster_cols) <- levels(annotations$coarse_clusters)
+
+
+other_pal <- discrete_palette_default[seq(1, length(discrete_palette_default), 2)]
+condition_cols <- discrete_palette_default[1:length(unique(annotations$condition))]
+names(condition_cols) <- unique(annotations$condition)
+
+ha <- HeatmapAnnotation(df = annotations, 
+                        col = list(Pseudotime = ptime_cols,
+                                   coarse_clusters = cluster_cols,
+                                   condition = condition_cols))
+
+hmap <- Heatmap(to_plot, name = "Z-scores\nNormalized Counts",
+       # column_order = ptime_order,
+        show_column_names = FALSE,
+        show_row_names = TRUE,
+       cluster_columns = FALSE,
+        top_annotation = ha)
+
+
+pdf(file.path(fig_dir, "pseudotime_heatmap.pdf"), width = 7, height = 9)
+draw(hmap)
+dev.off()
+```
+
+Mess around with smoothing functions
+
+```{r, eval = FALSE}
+ptime <- so$Pseudotime
+to_plot <- to_plot[, ptime_order] 
+loess_values <- apply(to_plot, 1, function(z){
+    d <- data.frame(z = z, 
+                    ptime = ptime)
+    tmp <- suppressWarnings(loess(z ~ ptime, data=d))
+    predict(tmp)
+}) %>% 
+  t()
+
+colnames(loess_values) <- colnames(to_plot)
+
+Heatmap(loess_values,
+        #column_order = ptime_order,
+        show_column_names = FALSE,
+        show_row_names = TRUE,
+        cluster_columns = FALSE,
+        top_annotation = ha)
+
+```
+
+## Resave
+```{r}
+qsave(so, file.path(object_dir, "bcell_subclustering.qs"))
+```
+
