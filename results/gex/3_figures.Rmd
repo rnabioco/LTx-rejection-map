@@ -305,9 +305,45 @@ save_plot(file.path(all_cell_outdir,
           base_height = 5)
 ```
 
-## Better represent samples
+#### Better represent samples
+
+```{r, eval = F}
+library(ggbeeswarm)
+library(ggpubr)
+library(rstatix)
+per_sample_counts <- group_by(get_metadata(so), orig.ident) %>%
+      mutate(n_cells = n()) %>%
+      group_by(orig.ident,
+               cell_types,
+               condition) %>%
+      summarize(n = n(),
+                prop_cell_type = n / unique(n_cells))
+
+# only perform testing on samples with at least 2 obs per gorup
+
+to_test <- per_sample_counts %>%
+  group_by(cell_types, condition) %>% 
+  summarize(nobs = n(),enough_obs = nobs > 1 ) %>%
+  group_by(cell_types) %>% 
+  summarize(keep = sum(enough_obs) == 2) %>% 
+  filter(keep) %>% 
+  pull(cell_types)
+
+stat.test <- filter(per_sample_counts, 
+                            cell_types %in% to_test) %>% 
+  group_by(cell_types) %>%
+  t_test(prop_cell_type ~ condition) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>% 
+  add_xy_position(x = "cell_types", dodge = 1)
+
+
+write_csv(stat.test, file.path(all_cell_outdir, "cell_count_stats.csv"))
+
+```
 
 ```{r}
+
 x <- get_cell_count_matrix(so, "cell_types", "orig.ident") 
 x <-  t(t(x) / colSums(x)) 
 plt_dat <- x %>% 
@@ -386,10 +422,50 @@ to_keep <- get_metadata(so) %>%
   pull(cell)
 so_sub <- subset(so, cells = to_keep)
 
+rename_cell_types <- c(
+  `alveolar macrophage` = "alveolar macrophage", 
+  `B cell` = "B cell", 
+  `B cell Mzb1+` = "plasma cell", 
+  `classical monocyte` = "monocyte", 
+  leukocyte = "leukocyte", 
+  `lung endothelial cell` = "lung structural cell",
+  `mast cell` = "mast cell",
+  `myeloid cell` = "myeloid cell",
+  `natural killer cell` = "natural killer cell", 
+  `T cell` = "T cell", 
+  `type II pneumocyte` = "Type 2 pneumocyte"
+)
+so_sub$pub_cell_types <- rename_cell_types[so_sub$cell_types]
+so_sub$pub_cell_types <- factor(so_sub$pub_cell_types, 
+                                levels = rename_cell_types)
+so_sub$cell_types_clusters <- str_c(so_sub$pub_cell_types,
+                                    " (",
+                                    so_sub$coarse_clusters,
+                                    ")")
+
+pub_cell_types_order <- so_sub@meta.data[c("pub_cell_types",
+                            "cell_types_clusters")] %>% 
+  as_tibble() %>% 
+  distinct() %>% 
+  arrange(pub_cell_types) %>% 
+  .[c(1:5, 10:15, 6:9), ] %>% 
+  pull(cell_types_clusters)
+
+pub_cell_types_cols <- discrete_palette_default[c(1:5, 7:9, 10, 10, 11, rep(6, 4))]
+
+
+so_sub$cell_types_clusters <- factor(so_sub$cell_types_clusters, 
+                                     levels = pub_cell_types_order)
+                                    
+topx_mod <- topx %>% 
+  ungroup() %>% 
+  mutate(group = factor(as.character(group), levels = str_match(pub_cell_types_order,
+                                                     "\\(([0-9]+)\\)")[, 2])) %>% 
+  arrange(group, padj, desc(logFC)) 
 p <- DoHeatmap(so_sub, 
-               group.colors = discrete_palette_default,
-        features = unique(topx$feature),
-        group.by = "coarse_clusters",
+               group.colors = pub_cell_types_cols,
+        features = unique(topx_mod$feature),
+        group.by = "cell_types_clusters",
         angle = 0,
         raster = FALSE, 
         draw.lines = TRUE,
@@ -397,7 +473,8 @@ p <- DoHeatmap(so_sub,
 
 p <- p +
   scale_fill_gradientn(colours = viridis::viridis(256),
-                       name = "Log-Normalized Counts\nZ-scores")
+                       name = "Log-Normalized Counts\nZ-scores") +
+  labs(color = "")
 
 save_plot(file.path(all_cell_outdir, "all_data_marker_heatmap_cell_subset.pdf"), 
           p,
@@ -616,6 +693,7 @@ save_plot(file.path(endo_cell_outdir,
 
 ```{r, results ='asis'}
 to_plot <- c(
+  "H2-Ab1",
   "Cldn5",
   "mt-Atp6",
   "Emp2",
@@ -686,6 +764,18 @@ save_plot(file.path(endo_cell_outdir,
           base_asp = 1.0,
           base_height = 14)
 
+```
+
+#### MHCII
+```{r}
+
+p <- scbp::plot_violins(so, 
+            group = "refined_clusters", 
+            features = "H2-Ab1",
+            split_by = "condition") +
+  labs(x = "",
+       y = "") 
+p
 ```
 
 ### Cell Proportions {.tabset}
@@ -870,7 +960,8 @@ p
 save_plot(file.path(b_cell_outdir,
                     "umap_by_cytotrace.pdf"),
           p,
-          base_asp = 1.2)
+          base_asp = 1.2,
+          base_height = 2.75)
 ```
 
 ### UMAP by gene {.tabset}
@@ -1132,6 +1223,39 @@ save_plot(file.path(b_cell_outdir,
 ```
 
 #### Better represent samples
+
+```{r, eval = F}
+library(ggbeeswarm)
+library(ggpubr)
+library(rstatix)
+per_sample_counts <- group_by(get_metadata(so), orig.ident) %>%
+      mutate(n_cells = n()) %>%
+      group_by(orig.ident,
+               coarse_clusters,
+               condition) %>%
+      summarize(n = n(),
+                percent_cell_type = 100 * n / unique(n_cells))
+
+# only perform testing on samples with at least 2 obs per gorup
+
+to_test <- per_sample_counts %>%
+  group_by(coarse_clusters, condition) %>% 
+  summarize(nobs = n(),enough_obs = nobs > 1 ) %>%
+  group_by(coarse_clusters) %>% 
+  summarize(keep = sum(enough_obs) == 2) %>% 
+  filter(keep) %>% 
+  pull(coarse_clusters)
+
+stat.test <- filter(per_sample_counts, 
+                            coarse_clusters %in% to_test) %>% 
+  group_by(coarse_clusters) %>%
+  t_test(percent_cell_type ~ condition) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>% 
+  add_xy_position(x = "coarse_clusters", dodge = 1)
+
+write_csv(stat.test, file.path(b_cell_outdir, "cell_count_stats.csv"))
+```
 
 ```{r}
 x <- get_cell_count_matrix(so, "coarse_clusters", "orig.ident") 
@@ -1411,4 +1535,82 @@ dev.off()
 #           base_height = 12)
 # 
 # p
+```
+
+## Compare b-cells to known b-cell subsets
+
+[GSE32372](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE32372)
+```{r}
+library(GEOquery)
+geo_dat <- getGEO("GSE32372")
+
+mat <- exprs(geo_dat$GSE32372_series_matrix.txt.gz)
+cell_types <- pData(geo_dat$GSE32372_series_matrix.txt.gz)$`cell type:ch1`
+samples <- split(colnames(mat), cell_types)
+avg_sig <- lapply(samples, function(ids){ rowMeans(mat[, ids], 
+                                                   na.rm = TRUE)})
+avg_sig <- do.call(cbind, avg_sig)
+
+rownames(avg_sig) <- featureData(geo_dat$GSE32372_series_matrix.txt.gz)$Symbol 
+library(clustifyr)
+res <- clustify(so,
+                ref_mat = avg_sig, 
+                cluster_col = "coarse_clusters", 
+                obj_out = FALSE, query_genes = VariableFeatures(FindVariableFeatures(so, nfeatures = 500)),
+                compute_method = "spearman")
+library(ComplexHeatmap)
+hmap <- Heatmap(t(res),
+                        name = "Spearman\ncorrelation",
+                        col = viridis::viridis(256),
+                        column_title = "B-cell clusters",
+                        column_title_side = "bottom")
+
+pdf(file.path(b_cell_outdir, "Correlation_to_bcell_subsets_GSE32372_v2.pdf"))
+draw(hmap)
+dev.off()
+```
+
+
+```{r}
+mat <- read_tsv("ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE60nnn/GSE60927/suppl/GSE60927_Raw_counts.txt.gz")
+
+samples <- colnames(mat[, 4:ncol(mat)])
+samples <- str_subset(samples, "rep")
+
+mat <- dplyr::select(mat, Symbol, all_of(samples) ) %>%
+  filter(!is.na(Symbol)) %>% 
+  mutate(Symbol = make.unique(Symbol)) %>% 
+  column_to_rownames("Symbol") %>% 
+  as.matrix()
+
+mat <- edgeR::cpm(mat)
+
+cell_types <- str_split(samples, "_") %>% 
+  map_chr(~.x[1:(length(.x) - 1)] %>% 
+            str_c(collapse = "_"))
+
+avg_mat <- split(colnames(mat), cell_types) %>% 
+  lapply(function(ids) rowMeans(mat[, ids], na.rm = TRUE)) %>% 
+  do.call(cbind, .) %>% 
+  log1p()
+
+res <- clustify(so, 
+                ref_mat = avg_mat, 
+                cluster_col = "coarse_clusters",
+                obj_out = FALSE, query_genes = VariableFeatures(FindVariableFeatures(so, nfeatures = 500)),
+                compute_method = "spearman")
+hmap <- Heatmap(t(res),
+                        name = "Spearman\ncorrelation",
+                        col = viridis::viridis(256),
+                        column_title = "B-cell clusters",
+                        column_title_side = "bottom")
+
+pdf(file.path(b_cell_outdir, "Correlation_to_bcell_subsets_GSE60927_2.pdf"))
+draw(hmap)
+dev.off()
+```
+
+
+```{r}
+plot_umap(so, "coarse_clusters")
 ```
